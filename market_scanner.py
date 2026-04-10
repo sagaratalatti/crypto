@@ -101,8 +101,19 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
         try:
             resp = session.get(GAMMA_MARKETS_URL, params=params, timeout=30)
             resp.raise_for_status()
+
+            # Check for non-JSON responses (Cloudflare challenge pages)
+            content_type = resp.headers.get("content-type", "")
+            if "application/json" not in content_type and "text/json" not in content_type:
+                body_preview = resp.text[:200] if resp.text else "(empty)"
+                logger.warning(
+                    f"Gamma API returned non-JSON (content-type: {content_type}). "
+                    f"Preview: {body_preview}"
+                )
+                break
+
             markets = resp.json()
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError) as e:
             logger.error(f"Failed to fetch markets at offset {offset}: {e}")
             break
 
@@ -119,6 +130,77 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
         time.sleep(0.3)  # Rate limiting
 
     logger.info(f"Fetched {len(all_markets)} active markets from Gamma API")
+    return all_markets
+
+
+def fetch_markets_via_clob(clob_client) -> list[dict]:
+    """
+    Fallback: fetch markets using the CLOB API when Gamma API is blocked.
+
+    The CLOB client's get_simplified_markets() returns market data
+    in a different format, so we normalize it to match Gamma's schema.
+    """
+    if not clob_client:
+        return []
+
+    all_markets = []
+    next_cursor = ""
+
+    try:
+        # The CLOB API returns paginated results
+        for _ in range(50):  # Max 50 pages
+            result = clob_client.get_simplified_markets(next_cursor=next_cursor)
+
+            # Handle both list and paginated dict responses
+            if isinstance(result, list):
+                markets_data = result
+                next_cursor = ""
+            elif isinstance(result, dict):
+                markets_data = result.get("data", result.get("markets", []))
+                next_cursor = result.get("next_cursor", "")
+            else:
+                break
+
+            if not markets_data:
+                break
+
+            for m in markets_data:
+                # Normalize CLOB format to Gamma-like format
+                tokens = m.get("tokens", [])
+                clob_token_ids = []
+                outcome_prices = []
+                outcomes = []
+
+                for token in tokens:
+                    clob_token_ids.append(token.get("token_id", ""))
+                    outcome_prices.append(str(token.get("price", 0)))
+                    outcomes.append(token.get("outcome", ""))
+
+                normalized = {
+                    "id": m.get("condition_id", m.get("id", "")),
+                    "question": m.get("question", ""),
+                    "slug": m.get("slug", m.get("market_slug", "")),
+                    "category": m.get("category", ""),
+                    "endDate": m.get("end_date_iso", m.get("end_date", "")),
+                    "outcomes": json.dumps(outcomes) if outcomes else "[]",
+                    "outcomePrices": json.dumps(outcome_prices) if outcome_prices else "[]",
+                    "clobTokenIds": json.dumps(clob_token_ids) if clob_token_ids else "[]",
+                    "volume24hr": m.get("volume24hr", 0),
+                    "volume": m.get("volume", 0),
+                    "liquidity": m.get("liquidity", 0),
+                    "tags": m.get("tags", []),
+                }
+                all_markets.append(normalized)
+
+            if not next_cursor:
+                break
+
+            time.sleep(0.2)
+
+    except Exception as e:
+        logger.error(f"Failed to fetch markets via CLOB: {e}")
+
+    logger.info(f"Fetched {len(all_markets)} markets via CLOB API fallback")
     return all_markets
 
 
@@ -392,7 +474,13 @@ def filter_markets(markets: list[MarketInfo]) -> list[MarketInfo]:
 
 def scan_markets(clob_client=None) -> list[MarketInfo]:
     """Full pipeline: fetch -> parse -> enrich -> filter -> sort by opportunity."""
+    # Try Gamma API first
     raw_markets = fetch_active_markets()
+
+    # Fallback to CLOB API if Gamma returned nothing (blocked by Cloudflare)
+    if not raw_markets and clob_client:
+        logger.info("Gamma API returned no results, falling back to CLOB API...")
+        raw_markets = fetch_markets_via_clob(clob_client)
 
     parsed = []
     for raw in raw_markets:
