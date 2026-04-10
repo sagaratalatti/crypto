@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from tabulate import tabulate
 
 import config
-from market_scanner import scan_markets, MarketInfo
+from market_scanner import scan_markets, MarketInfo, test_connectivity
 from strategy import generate_signals, TradeOpportunity
 from risk_manager import size_positions, validate_trade, calculate_stop_loss, calculate_take_profit
 from executor import (
@@ -560,6 +560,89 @@ def cmd_backtest(args):
     print(f"\n{'='*80}")
 
 
+def cmd_test(args):
+    """Test connectivity to Polymarket APIs."""
+    print(f"\n{'='*70}")
+    print("  CONNECTIVITY DIAGNOSTICS")
+    print(f"{'='*70}\n")
+
+    results = test_connectivity()
+
+    # Internet check
+    inet = results.get("internet", {})
+    status = "OK" if inet.get("ok") else "FAIL"
+    print(f"  Internet:     [{status}]  Your IP: {inet.get('your_ip', '?')}")
+
+    # Gamma API
+    gamma = results.get("gamma_api", {})
+    status = "OK" if gamma.get("ok") else "FAIL"
+    print(f"  Gamma API:    [{status}]  HTTP {gamma.get('status', '?')}"
+          f"  Server: {gamma.get('server', '?')}")
+    if gamma.get("error"):
+        print(f"                Error: {gamma['error']}")
+    if gamma.get("ok") and gamma.get("body_preview"):
+        # Check if we got JSON or a Cloudflare page
+        preview = gamma["body_preview"]
+        if preview.startswith("[") or preview.startswith("{"):
+            print(f"                Response: Valid JSON")
+        else:
+            print(f"                Response: {preview[:100]}...")
+
+    # CLOB API
+    clob = results.get("clob_api", {})
+    status = "OK" if clob.get("ok") else "FAIL"
+    print(f"  CLOB API:     [{status}]  HTTP {clob.get('status', '?')}"
+          f"  Server: {clob.get('server', '?')}")
+    if clob.get("error"):
+        print(f"                Error: {clob['error']}")
+
+    # CLOB time
+    clob_time = results.get("clob_time", {})
+    status = "OK" if clob_time.get("ok") else "FAIL"
+    print(f"  CLOB /time:   [{status}]  {clob_time.get('body', clob_time.get('error', '?'))}")
+
+    # CLOB client auth
+    print()
+    if config.PRIVATE_KEY:
+        print("  Wallet:       Private key configured")
+        print(f"  Address:      {config.WALLET_ADDRESS or 'not set'}")
+        print(f"  Sig type:     {config.SIGNATURE_TYPE}")
+        try:
+            client = create_clob_client()
+            print("  Auth:         [OK] CLOB client authenticated")
+        except Exception as e:
+            print(f"  Auth:         [FAIL] {e}")
+    else:
+        print("  Wallet:       No PRIVATE_KEY set (read-only mode)")
+
+    print(f"\n  Config:")
+    print(f"    Gamma URL:  {config.GAMMA_API_URL}")
+    print(f"    CLOB URL:   {config.CLOB_API_URL}")
+    print(f"    Chain ID:   {config.CHAIN_ID}")
+    print(f"    Bankroll:   ${config.BANKROLL:.2f}")
+    print(f"    Dry run:    {config.DRY_RUN}")
+
+    # Recommendations
+    print()
+    all_ok = gamma.get("ok") and clob.get("ok")
+    if all_ok:
+        print("  All APIs reachable. You're good to trade!")
+    elif inet.get("ok"):
+        print("  TROUBLESHOOTING:")
+        print("  Your internet works but Polymarket APIs are blocked.")
+        print("  Possible causes:")
+        print("    1. Cloudflare is blocking your IP (try a different VPN region)")
+        print("    2. Your ISP/network blocks these domains")
+        print("    3. Polymarket is geo-restricted in your region")
+        print()
+        print("  Try these VPN regions: Netherlands, Germany, UK, Singapore")
+        print("  Avoid: US (some restrictions), Japan (some datacenter IPs blocked)")
+    else:
+        print("  No internet connectivity detected. Check your network.")
+
+    print(f"\n{'='*70}")
+
+
 def cmd_cancel_all(args):
     """Cancel all open orders."""
     clob_client = create_clob_client()
@@ -617,6 +700,7 @@ Configuration:
                            choices=["mean_reversion", "momentum", "volume_spike"],
                            help="Strategy to backtest (default: mean_reversion)")
 
+    subparsers.add_parser("test", help="Test connectivity to Polymarket APIs")
     subparsers.add_parser("cancel-all", help="Cancel all open orders")
 
     args = parser.parse_args()
@@ -631,6 +715,7 @@ Configuration:
         "risk": cmd_risk,
         "intel": cmd_intel,
         "backtest": cmd_backtest,
+        "test": cmd_test,
         "cancel-all": cmd_cancel_all,
     }
 

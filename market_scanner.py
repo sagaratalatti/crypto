@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 from reports import log_market_scanned
@@ -22,6 +24,33 @@ logger = logging.getLogger(__name__)
 
 GAMMA_MARKETS_URL = f"{config.GAMMA_API_URL}/markets"
 GAMMA_EVENTS_URL = f"{config.GAMMA_API_URL}/events"
+
+# Proper headers to avoid Cloudflare/bot detection blocks
+API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
+def _create_session() -> requests.Session:
+    """Create a requests session with retry logic and proper headers."""
+    session = requests.Session()
+    session.headers.update(API_HEADERS)
+
+    retries = Retry(
+        total=3,
+        backoff_factor=2,  # 2s, 4s, 8s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
 
 
 @dataclass
@@ -48,12 +77,16 @@ class MarketInfo:
     days_to_resolution: float = -1.0  # -1 = unknown
     theta_regime: str = "unknown"
     theta_size_multiplier: float = 1.0
+    # BTC-specific fields
+    btc_price_target: float = 0.0  # Extracted price target (e.g., 80000)
+    btc_direction: str = ""        # "above" or "below" or "hit" or ""
 
 
 def fetch_active_markets(limit: int = 100) -> list[dict]:
     """Fetch active, tradeable markets from Gamma API with pagination."""
     all_markets = []
     offset = 0
+    session = _create_session()
 
     while True:
         params = {
@@ -66,7 +99,7 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
         }
 
         try:
-            resp = requests.get(GAMMA_MARKETS_URL, params=params, timeout=30)
+            resp = session.get(GAMMA_MARKETS_URL, params=params, timeout=30)
             resp.raise_for_status()
             markets = resp.json()
         except requests.RequestException as e:
@@ -83,10 +116,66 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
         if offset > 5000:
             break
 
-        time.sleep(0.2)  # Rate limiting
+        time.sleep(0.3)  # Rate limiting
 
     logger.info(f"Fetched {len(all_markets)} active markets from Gamma API")
     return all_markets
+
+
+def test_connectivity() -> dict:
+    """Test connectivity to all Polymarket API endpoints. Returns diagnostic info."""
+    results = {}
+    session = _create_session()
+
+    # Test Gamma API
+    try:
+        resp = session.get(f"{config.GAMMA_API_URL}/markets",
+                          params={"limit": "1"}, timeout=15)
+        results["gamma_api"] = {
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "content_type": resp.headers.get("content-type", ""),
+            "server": resp.headers.get("server", ""),
+            "body_preview": resp.text[:200] if resp.text else "",
+        }
+    except requests.RequestException as e:
+        results["gamma_api"] = {"status": 0, "ok": False, "error": str(e)}
+
+    # Test CLOB API
+    try:
+        resp = session.get(f"{config.CLOB_API_URL}/", timeout=15)
+        results["clob_api"] = {
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "content_type": resp.headers.get("content-type", ""),
+            "server": resp.headers.get("server", ""),
+            "body_preview": resp.text[:200] if resp.text else "",
+        }
+    except requests.RequestException as e:
+        results["clob_api"] = {"status": 0, "ok": False, "error": str(e)}
+
+    # Test CLOB server time (lightweight endpoint)
+    try:
+        resp = session.get(f"{config.CLOB_API_URL}/time", timeout=15)
+        results["clob_time"] = {
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "body": resp.text[:100] if resp.text else "",
+        }
+    except requests.RequestException as e:
+        results["clob_time"] = {"status": 0, "ok": False, "error": str(e)}
+
+    # General internet check
+    try:
+        resp = session.get("https://httpbin.org/ip", timeout=10)
+        results["internet"] = {
+            "ok": True,
+            "your_ip": resp.json().get("origin", "unknown") if resp.ok else "unknown",
+        }
+    except requests.RequestException:
+        results["internet"] = {"ok": False, "your_ip": "unreachable"}
+
+    return results
 
 
 def parse_market(raw: dict) -> Optional[MarketInfo]:
@@ -173,6 +262,102 @@ def enrich_with_orderbook(market: MarketInfo, clob_client) -> MarketInfo:
     return market
 
 
+import re
+
+# ─── BTC Market Detection ────────────────────────────────────────────────────
+
+def is_btc_market(market: MarketInfo) -> bool:
+    """Check if a market is about Bitcoin price."""
+    q = market.question.lower()
+    slug = market.slug.lower() if market.slug else ""
+    tags_lower = [t.lower() for t in market.tags]
+
+    # Check question text
+    for kw in config.BTC_KEYWORDS:
+        if kw in q:
+            return True
+
+    # Check slug
+    if "bitcoin" in slug or "btc" in slug:
+        return True
+
+    # Check tags
+    if any("bitcoin" in t or "btc" in t for t in tags_lower):
+        return True
+
+    return False
+
+
+def extract_btc_price_target(market: MarketInfo) -> tuple[float, str]:
+    """
+    Extract the BTC price target and direction from a market question.
+
+    Examples:
+    - "Will Bitcoin hit $80,000?" -> (80000, "hit")
+    - "Bitcoin above $75k by April?" -> (75000, "above")
+    - "What price will Bitcoin hit in April?" -> (0, "range") (multi-outcome)
+    """
+    q = market.question
+
+    # Match patterns like $80,000 or $80000 or 80,000 or 80k or 80K
+    patterns = [
+        r'\$?([\d,]+)[kK]',           # 80k, $80K
+        r'\$\s*([\d,]+(?:\.\d+)?)',    # $80,000 or $80000
+        r'([\d,]{4,})',                # 80000 or 80,000 (4+ digits)
+    ]
+
+    price = 0.0
+    for pattern in patterns:
+        matches = re.findall(pattern, q)
+        for match in matches:
+            try:
+                val = float(match.replace(",", ""))
+                # If it looks like "80k" format, multiply by 1000
+                if val < 1000 and "k" in q.lower():
+                    val *= 1000
+                # Reasonable BTC price range
+                if 10000 <= val <= 500000:
+                    price = val
+                    break
+            except ValueError:
+                continue
+        if price > 0:
+            break
+
+    # Detect direction
+    q_lower = q.lower()
+    direction = ""
+    if "above" in q_lower or "over" in q_lower or "exceed" in q_lower:
+        direction = "above"
+    elif "below" in q_lower or "under" in q_lower:
+        direction = "below"
+    elif "hit" in q_lower or "reach" in q_lower:
+        direction = "hit"
+    elif "price" in q_lower and "what" in q_lower:
+        direction = "range"
+    elif price > 0:
+        direction = "hit"  # Default for price-target markets
+
+    return price, direction
+
+
+def enrich_btc_fields(markets: list[MarketInfo]) -> list[MarketInfo]:
+    """Enrich BTC markets with price target and direction data."""
+    for m in markets:
+        if is_btc_market(m):
+            target, direction = extract_btc_price_target(m)
+            m.btc_price_target = target
+            m.btc_direction = direction
+    return markets
+
+
+def filter_btc_markets(markets: list[MarketInfo]) -> list[MarketInfo]:
+    """Filter to only Bitcoin price markets."""
+    btc = [m for m in markets if is_btc_market(m)]
+    logger.info(f"Found {len(btc)} Bitcoin markets out of {len(markets)} total")
+    return btc
+
+
 def filter_markets(markets: list[MarketInfo]) -> list[MarketInfo]:
     """Filter markets by trading criteria defined in config."""
     filtered = []
@@ -237,6 +422,11 @@ def scan_markets(clob_client=None) -> list[MarketInfo]:
 
     # Filter by trading criteria
     tradeable = filter_markets(parsed)
+
+    # BTC-only mode: filter to Bitcoin markets only
+    if config.BTC_ONLY_MODE:
+        tradeable = filter_btc_markets(tradeable)
+        tradeable = enrich_btc_fields(tradeable)
 
     # Sort by volume (most liquid first)
     tradeable.sort(key=lambda m: m.volume_24h, reverse=True)
