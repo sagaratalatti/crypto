@@ -12,6 +12,7 @@ from typing import Optional
 
 from executor import Position, OrderRecord
 from risk_manager import PortfolioState
+from reports import log_trade_opened, log_trade_closed
 import config
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,20 @@ def add_position(state: dict, order: OrderRecord, stop_loss: float, take_profit:
     state["trade_count"] = state.get("trade_count", 0) + 1
     save_state(state)
 
+    # Log trade event for reports
+    log_trade_opened(
+        order_id=order.order_id,
+        market_id=order.market_id,
+        question=order.reason[:100],
+        side=order.side,
+        signal=order.signal,
+        entry_price=order.price,
+        size=order.size,
+        cost_basis=order.dollar_amount,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+
     logger.info(
         f"Position opened: {order.side} {order.size} shares at ${order.price:.3f} "
         f"(cost=${order.dollar_amount:.2f}, SL=${stop_loss:.3f}, TP=${take_profit:.3f})"
@@ -129,6 +144,21 @@ def close_position(state: dict, position_idx: int, exit_price: float, reason: st
         state["win_count"] = state.get("win_count", 0) + 1
 
     save_state(state)
+
+    # Log trade close event for reports
+    log_trade_closed(
+        order_id=pos.get("order_id", ""),
+        market_id=pos.get("market_id", ""),
+        question=pos.get("market_question", ""),
+        side=pos.get("side", ""),
+        signal=pos.get("signal", ""),
+        entry_price=pos.get("entry_price", 0),
+        exit_price=exit_price,
+        size=pos.get("size", 0),
+        cost_basis=pos.get("cost_basis", 0),
+        realized_pnl=pnl,
+        close_reason=reason,
+    )
 
     logger.info(
         f"Position closed: PnL=${pnl:+.4f} ({reason}), "

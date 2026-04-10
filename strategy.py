@@ -318,11 +318,23 @@ def generate_signals(markets: list[MarketInfo]) -> list[TradeOpportunity]:
     all_opportunities = []
 
     for market in markets:
+        # Skip expired markets
+        if market.theta_regime == "expired":
+            continue
+
         # Run each strategy
         all_opportunities.extend(analyze_spread_capture(market))
         all_opportunities.extend(analyze_value_bet(market))
         all_opportunities.extend(analyze_mean_reversion(market))
         all_opportunities.extend(analyze_momentum(market))
+
+    # Apply time-to-resolution adjustments
+    for opp in all_opportunities:
+        theta_mult = opp.market.theta_size_multiplier
+        if theta_mult < 1.0:
+            # Reduce confidence for markets near expiry
+            opp.confidence *= theta_mult
+            opp.reason += f" [theta:{opp.market.theta_regime}, {opp.market.days_to_resolution:.0f}d]"
 
     # Filter by minimum edge
     qualified = [o for o in all_opportunities if o.edge >= config.MIN_EDGE]

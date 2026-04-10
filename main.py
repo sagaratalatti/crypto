@@ -10,6 +10,10 @@ Usage:
     python main.py analyze       # Full analysis with position sizing
     python main.py trade         # Execute trades (requires wallet config)
     python main.py portfolio     # Show portfolio status
+    python main.py report        # Full P&L report with timestamps
+    python main.py risk          # Sharpe, Sortino, VaR, drawdown analysis
+    python main.py intel         # Market correlations, whales, momentum
+    python main.py backtest      # Backtest strategies on price history
     python main.py run           # Continuous trading loop
     python main.py cancel-all    # Cancel all open orders
 
@@ -45,6 +49,24 @@ from portfolio import (
     check_stop_loss_take_profit,
     get_portfolio_summary,
 )
+from reports import (
+    generate_performance_report,
+    export_trades_csv,
+    export_report_json,
+    export_equity_curve_csv,
+)
+from risk_metrics import compute_all_risk_metrics, format_risk_report
+from execution_tracker import compute_execution_metrics, format_execution_report
+from price_tracker import (
+    get_tracked_markets,
+    compute_market_analytics,
+    backtest_strategy,
+    mean_reversion_strategy,
+    momentum_strategy,
+    volume_spike_strategy,
+    format_backtest_report,
+)
+from market_intelligence import format_market_intelligence_report
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -354,6 +376,190 @@ def cmd_run(args):
     cmd_portfolio(args)
 
 
+def cmd_report(args):
+    """Generate detailed performance analysis report."""
+    state = load_state()
+
+    # Try to refresh prices first
+    try:
+        clob_client = create_clob_client()
+        state = update_position_prices(state, clob_client)
+    except Exception:
+        pass
+
+    # Print the full report
+    print(generate_performance_report(state))
+
+    # Risk metrics
+    risk = compute_all_risk_metrics(state)
+    print(format_risk_report(risk))
+
+    # Execution quality
+    exec_metrics = compute_execution_metrics()
+    print(format_execution_report(exec_metrics))
+
+    # Handle exports
+    export_format = getattr(args, "export", None)
+    if export_format:
+        if export_format == "csv":
+            trades_path = export_trades_csv(state)
+            curve_path = export_equity_curve_csv(state)
+            print(f"\n  Exported trades to:       {trades_path}")
+            print(f"  Exported equity curve to: {curve_path}")
+        elif export_format == "json":
+            json_path = export_report_json(state)
+            print(f"\n  Exported report to: {json_path}")
+        elif export_format == "all":
+            trades_path = export_trades_csv(state)
+            curve_path = export_equity_curve_csv(state)
+            json_path = export_report_json(state)
+            print(f"\n  Exported trades CSV:      {trades_path}")
+            print(f"  Exported equity curve:    {curve_path}")
+            print(f"  Exported report JSON:     {json_path}")
+
+
+def cmd_risk(args):
+    """Display advanced risk metrics."""
+    state = load_state()
+    risk = compute_all_risk_metrics(state)
+
+    print(f"\n{'='*80}")
+    print("  RISK DASHBOARD")
+    print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*80}")
+    print(format_risk_report(risk))
+    print(format_execution_report(compute_execution_metrics()))
+    print(f"\n{'='*80}")
+
+
+def cmd_intel(args):
+    """Display market intelligence: correlations, whales, category momentum."""
+    logger.info("Gathering market intelligence...")
+
+    clob_client = None
+    try:
+        clob_client = create_clob_client()
+    except Exception:
+        logger.warning("Running without CLOB client")
+
+    markets = scan_markets(clob_client)
+
+    print(f"\n{'='*80}")
+    print(f"  MARKET INTELLIGENCE — {len(markets)} markets analyzed")
+    print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*80}")
+    print(format_market_intelligence_report(markets, clob_client))
+
+    # Show time-to-resolution summary
+    print("\n  TIME-TO-RESOLUTION SUMMARY:")
+    print("  " + "-" * 76)
+    regime_counts = {}
+    for m in markets:
+        r = m.theta_regime
+        regime_counts[r] = regime_counts.get(r, 0) + 1
+
+    for regime, count in sorted(regime_counts.items()):
+        print(f"    {regime:20s}  {count:>4d} markets")
+
+    print(f"\n{'='*80}")
+
+
+def cmd_backtest(args):
+    """Backtest strategies against historical price data."""
+    tracked = get_tracked_markets()
+
+    if not tracked:
+        print("\nNo price history available yet. Run 'python main.py scan' a few times first")
+        print("to build up price snapshots, then backtest against them.")
+        return
+
+    market_id = getattr(args, "market_id", None)
+
+    strategies = {
+        "mean_reversion": mean_reversion_strategy,
+        "momentum": momentum_strategy,
+        "volume_spike": volume_spike_strategy,
+    }
+    strategy_name = getattr(args, "strategy", "mean_reversion")
+
+    if strategy_name not in strategies:
+        print(f"Unknown strategy: {strategy_name}. Available: {', '.join(strategies.keys())}")
+        return
+
+    strategy_fn = strategies[strategy_name]
+
+    print(f"\n{'='*80}")
+    print(f"  BACKTESTING — Strategy: {strategy_name}")
+    print(f"{'='*80}")
+
+    if market_id:
+        # Backtest single market
+        question = tracked.get(market_id, market_id)
+        result = backtest_strategy(market_id, strategy_fn)
+        print(format_backtest_report(result, question))
+    else:
+        # Backtest all tracked markets
+        results = []
+        for mid, question in tracked.items():
+            analytics = compute_market_analytics(mid)
+            if analytics.get("snapshots", 0) < 10:
+                continue
+            result = backtest_strategy(mid, strategy_fn)
+            if result.get("status") == "ok":
+                result["market_id"] = mid
+                result["question"] = question
+                results.append(result)
+
+        if not results:
+            print("\n  No markets have enough price history for backtesting (need >= 10 snapshots).")
+            print(f"  Tracked markets: {len(tracked)}")
+            return
+
+        # Summary table
+        table_data = []
+        for r in sorted(results, key=lambda x: x["total_return_pct"], reverse=True):
+            table_data.append([
+                r["question"][:40] + "...",
+                r["total_trades"],
+                f"{r['win_rate']:.0f}%",
+                f"${r['total_return']:+.2f}",
+                f"{r['total_return_pct']:+.1f}%",
+                f"{r['max_drawdown_pct']:.1f}%",
+                f"{r['sharpe']:.3f}",
+                r["snapshots_used"],
+            ])
+
+        headers = ["Market", "Trades", "Win%", "Return$", "Return%", "MaxDD", "Sharpe", "Data"]
+        print(f"\n  Results across {len(results)} markets:")
+        print("  " + tabulate(table_data, headers=headers, tablefmt="simple").replace("\n", "\n  "))
+
+        # Aggregate stats
+        total_return = sum(r["total_return"] for r in results)
+        avg_sharpe = sum(r["sharpe"] for r in results) / len(results)
+        avg_win_rate = sum(r["win_rate"] for r in results) / len(results)
+        profitable = len([r for r in results if r["total_return"] > 0])
+
+        print(f"\n  Aggregate: {profitable}/{len(results)} profitable | "
+              f"Total: ${total_return:+.2f} | "
+              f"Avg Sharpe: {avg_sharpe:.3f} | "
+              f"Avg Win Rate: {avg_win_rate:.0f}%")
+
+    # Show price analytics if single market
+    if market_id:
+        analytics = compute_market_analytics(market_id)
+        if analytics.get("status") == "ok":
+            print(f"\n  PRICE ANALYTICS:")
+            print(f"    Current:     {analytics['current_price']:.4f}")
+            print(f"    Trend:       {analytics['trend_direction']} ({analytics['trend_per_hour']:+.6f}/hr)")
+            print(f"    Volatility:  {analytics['volatility']:.4f}")
+            print(f"    SMA 5/20:    {analytics['sma_5']:.4f} / {analytics['sma_20']:.4f} ({analytics['sma_crossover']})")
+            print(f"    Support:     {analytics['support']:.4f}")
+            print(f"    Resistance:  {analytics['resistance']:.4f}")
+            print(f"    Volume:      {analytics['volume_ratio']:.1f}x average")
+
+    print(f"\n{'='*80}")
+
+
 def cmd_cancel_all(args):
     """Cancel all open orders."""
     clob_client = create_clob_client()
@@ -374,6 +580,12 @@ Examples:
   python main.py trade             # Execute one round of trades
   python main.py run               # Continuous trading loop
   python main.py portfolio         # Check positions & P&L
+  python main.py report            # Full performance report with risk metrics
+  python main.py report --export all   # Export trades CSV + JSON + equity curve
+  python main.py risk              # Sharpe, Sortino, VaR, drawdown dashboard
+  python main.py intel             # Cross-market correlations & whale signals
+  python main.py backtest          # Backtest all tracked markets
+  python main.py backtest --strategy momentum --market-id <id>
   python main.py cancel-all        # Emergency: cancel all orders
 
 Configuration:
@@ -389,6 +601,22 @@ Configuration:
     subparsers.add_parser("trade", help="Execute trades")
     subparsers.add_parser("run", help="Continuous trading loop")
     subparsers.add_parser("portfolio", help="Show portfolio status")
+
+    report_parser = subparsers.add_parser("report", help="Performance report with P&L analysis")
+    report_parser.add_argument(
+        "--export", choices=["csv", "json", "all"],
+        help="Export report data (csv=trades+equity curve, json=full report, all=everything)"
+    )
+
+    subparsers.add_parser("risk", help="Advanced risk metrics (Sharpe, VaR, drawdown)")
+    subparsers.add_parser("intel", help="Market intelligence (correlations, whales, momentum)")
+
+    bt_parser = subparsers.add_parser("backtest", help="Backtest strategies against price history")
+    bt_parser.add_argument("--market-id", help="Backtest a specific market (default: all tracked)")
+    bt_parser.add_argument("--strategy", default="mean_reversion",
+                           choices=["mean_reversion", "momentum", "volume_spike"],
+                           help="Strategy to backtest (default: mean_reversion)")
+
     subparsers.add_parser("cancel-all", help="Cancel all open orders")
 
     args = parser.parse_args()
@@ -399,6 +627,10 @@ Configuration:
         "trade": cmd_trade,
         "run": cmd_run,
         "portfolio": cmd_portfolio,
+        "report": cmd_report,
+        "risk": cmd_risk,
+        "intel": cmd_intel,
+        "backtest": cmd_backtest,
         "cancel-all": cmd_cancel_all,
     }
 
