@@ -22,6 +22,7 @@ from py_clob_client.clob_types import (
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from strategy import TradeOpportunity, Side
+from execution_tracker import log_order_placed, log_order_filled, log_order_cancelled
 import config
 
 logger = logging.getLogger(__name__)
@@ -135,8 +136,22 @@ def execute_limit_order(
             f"{opportunity.market.question[:60]}... "
             f"at ${price:.3f} (${opportunity.dollar_size:.2f})"
         )
+        order_id = f"dry_run_{int(time.time())}"
+        log_order_placed(
+            order_id=order_id,
+            market_id=opportunity.market.market_id,
+            order_type="GTC",
+            side=opportunity.side.value,
+            expected_price=price,
+            size=num_shares,
+            dollar_amount=opportunity.dollar_size,
+            book_best_bid=opportunity.market.best_bid,
+            book_best_ask=opportunity.market.best_ask,
+            book_spread=opportunity.market.spread,
+        )
+        log_order_filled(order_id, price, num_shares, opportunity.dollar_size)
         return OrderRecord(
-            order_id=f"dry_run_{int(time.time())}",
+            order_id=order_id,
             market_id=opportunity.market.market_id,
             token_id=token_id,
             side=opportunity.side.value,
@@ -161,6 +176,19 @@ def execute_limit_order(
         response = clob_client.post_order(signed_order, OrderType.GTC)
 
         order_id = response.get("orderID", response.get("id", "unknown"))
+
+        log_order_placed(
+            order_id=order_id,
+            market_id=opportunity.market.market_id,
+            order_type="GTC",
+            side=opportunity.side.value,
+            expected_price=price,
+            size=num_shares,
+            dollar_amount=opportunity.dollar_size,
+            book_best_bid=opportunity.market.best_bid,
+            book_best_ask=opportunity.market.best_ask,
+            book_spread=opportunity.market.spread,
+        )
 
         logger.info(
             f"Limit order placed: {order_id} - BUY {num_shares} shares "

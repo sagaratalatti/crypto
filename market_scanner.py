@@ -16,6 +16,7 @@ import requests
 
 import config
 from reports import log_market_scanned
+from price_tracker import record_price_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ class MarketInfo:
     midpoint: float = 0.0
     order_book_depth: float = 0.0
     tags: list[str] = field(default_factory=list)
+    # Time-to-resolution fields (populated by enrichment)
+    days_to_resolution: float = -1.0  # -1 = unknown
+    theta_regime: str = "unknown"
+    theta_size_multiplier: float = 1.0
 
 
 def fetch_active_markets(limit: int = 100) -> list[dict]:
@@ -221,13 +226,22 @@ def scan_markets(clob_client=None) -> list[MarketInfo]:
             time.sleep(0.1)  # Rate limiting
         parsed = enriched
 
+    # Enrich with time-to-resolution (late import to avoid circular dependency)
+    from market_intelligence import compute_time_to_resolution
+    for m in parsed:
+        ttr = compute_time_to_resolution(m)
+        if ttr.get("has_end_date"):
+            m.days_to_resolution = ttr.get("days_remaining", -1)
+            m.theta_regime = ttr.get("theta_regime", "unknown")
+            m.theta_size_multiplier = ttr.get("size_multiplier", 1.0)
+
     # Filter by trading criteria
     tradeable = filter_markets(parsed)
 
     # Sort by volume (most liquid first)
     tradeable.sort(key=lambda m: m.volume_24h, reverse=True)
 
-    # Log top scanned markets for reporting
+    # Log top scanned markets and record price snapshots
     for m in tradeable[:10]:
         price = m.midpoint if m.midpoint > 0 else (m.outcome_prices[0] if m.outcome_prices else 0)
         log_market_scanned(
@@ -237,6 +251,22 @@ def scan_markets(clob_client=None) -> list[MarketInfo]:
             volume_24h=m.volume_24h,
             liquidity=m.liquidity,
             category=m.category,
+        )
+
+    # Record price snapshots for all tradeable markets (feeds backtesting)
+    for m in tradeable:
+        yes_price = m.outcome_prices[0] if m.outcome_prices else 0
+        no_price = m.outcome_prices[1] if len(m.outcome_prices) > 1 else 0
+        record_price_snapshot(
+            market_id=m.market_id,
+            question=m.question,
+            yes_price=yes_price,
+            no_price=no_price,
+            volume_24h=m.volume_24h,
+            liquidity=m.liquidity,
+            best_bid=m.best_bid,
+            best_ask=m.best_ask,
+            spread=m.spread,
         )
 
     return tradeable

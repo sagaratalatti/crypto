@@ -9,4 +9,7 @@ data/
 *.log
 portfolio_state.json
 trade_log.json
+execution_log.json
+price_history.json
+whale_signals.json
 reports/
