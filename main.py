@@ -10,6 +10,7 @@ Usage:
     python main.py analyze       # Full analysis with position sizing
     python main.py trade         # Execute trades (requires wallet config)
     python main.py portfolio     # Show portfolio status
+    python main.py report        # Full P&L report with timestamps
     python main.py run           # Continuous trading loop
     python main.py cancel-all    # Cancel all open orders
 
@@ -44,6 +45,12 @@ from portfolio import (
     update_position_prices,
     check_stop_loss_take_profit,
     get_portfolio_summary,
+)
+from reports import (
+    generate_performance_report,
+    export_trades_csv,
+    export_report_json,
+    export_equity_curve_csv,
 )
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -354,6 +361,40 @@ def cmd_run(args):
     cmd_portfolio(args)
 
 
+def cmd_report(args):
+    """Generate detailed performance analysis report."""
+    state = load_state()
+
+    # Try to refresh prices first
+    try:
+        clob_client = create_clob_client()
+        state = update_position_prices(state, clob_client)
+    except Exception:
+        pass
+
+    # Print the full report
+    print(generate_performance_report(state))
+
+    # Handle exports
+    export_format = getattr(args, "export", None)
+    if export_format:
+        if export_format == "csv":
+            trades_path = export_trades_csv(state)
+            curve_path = export_equity_curve_csv(state)
+            print(f"\n  Exported trades to:       {trades_path}")
+            print(f"  Exported equity curve to: {curve_path}")
+        elif export_format == "json":
+            json_path = export_report_json(state)
+            print(f"\n  Exported report to: {json_path}")
+        elif export_format == "all":
+            trades_path = export_trades_csv(state)
+            curve_path = export_equity_curve_csv(state)
+            json_path = export_report_json(state)
+            print(f"\n  Exported trades CSV:      {trades_path}")
+            print(f"  Exported equity curve:    {curve_path}")
+            print(f"  Exported report JSON:     {json_path}")
+
+
 def cmd_cancel_all(args):
     """Cancel all open orders."""
     clob_client = create_clob_client()
@@ -374,6 +415,10 @@ Examples:
   python main.py trade             # Execute one round of trades
   python main.py run               # Continuous trading loop
   python main.py portfolio         # Check positions & P&L
+  python main.py report            # Full performance report
+  python main.py report --export csv   # Export trades + equity curve CSV
+  python main.py report --export json  # Export full report as JSON
+  python main.py report --export all   # Export everything
   python main.py cancel-all        # Emergency: cancel all orders
 
 Configuration:
@@ -389,6 +434,13 @@ Configuration:
     subparsers.add_parser("trade", help="Execute trades")
     subparsers.add_parser("run", help="Continuous trading loop")
     subparsers.add_parser("portfolio", help="Show portfolio status")
+
+    report_parser = subparsers.add_parser("report", help="Performance report with P&L analysis")
+    report_parser.add_argument(
+        "--export", choices=["csv", "json", "all"],
+        help="Export report data (csv=trades+equity curve, json=full report, all=everything)"
+    )
+
     subparsers.add_parser("cancel-all", help="Cancel all open orders")
 
     args = parser.parse_args()
@@ -399,6 +451,7 @@ Configuration:
         "trade": cmd_trade,
         "run": cmd_run,
         "portfolio": cmd_portfolio,
+        "report": cmd_report,
         "cancel-all": cmd_cancel_all,
     }
 

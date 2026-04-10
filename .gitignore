@@ -8,3 +8,5 @@ venv/
 data/
 *.log
 portfolio_state.json
+trade_log.json
+reports/

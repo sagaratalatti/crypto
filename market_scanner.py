@@ -15,6 +15,7 @@ from typing import Optional
 import requests
 
 import config
+from reports import log_market_scanned
 
 logger = logging.getLogger(__name__)
 
@@ -225,5 +226,17 @@ def scan_markets(clob_client=None) -> list[MarketInfo]:
 
     # Sort by volume (most liquid first)
     tradeable.sort(key=lambda m: m.volume_24h, reverse=True)
+
+    # Log top scanned markets for reporting
+    for m in tradeable[:10]:
+        price = m.midpoint if m.midpoint > 0 else (m.outcome_prices[0] if m.outcome_prices else 0)
+        log_market_scanned(
+            market_id=m.market_id,
+            question=m.question,
+            price=price,
+            volume_24h=m.volume_24h,
+            liquidity=m.liquidity,
+            category=m.category,
+        )
 
     return tradeable
