@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 from reports import log_market_scanned
@@ -22,6 +24,33 @@ logger = logging.getLogger(__name__)
 
 GAMMA_MARKETS_URL = f"{config.GAMMA_API_URL}/markets"
 GAMMA_EVENTS_URL = f"{config.GAMMA_API_URL}/events"
+
+# Proper headers to avoid Cloudflare/bot detection blocks
+API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
+def _create_session() -> requests.Session:
+    """Create a requests session with retry logic and proper headers."""
+    session = requests.Session()
+    session.headers.update(API_HEADERS)
+
+    retries = Retry(
+        total=3,
+        backoff_factor=2,  # 2s, 4s, 8s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
 
 
 @dataclass
@@ -54,6 +83,7 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
     """Fetch active, tradeable markets from Gamma API with pagination."""
     all_markets = []
     offset = 0
+    session = _create_session()
 
     while True:
         params = {
@@ -66,7 +96,7 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
         }
 
         try:
-            resp = requests.get(GAMMA_MARKETS_URL, params=params, timeout=30)
+            resp = session.get(GAMMA_MARKETS_URL, params=params, timeout=30)
             resp.raise_for_status()
             markets = resp.json()
         except requests.RequestException as e:
@@ -83,10 +113,66 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
         if offset > 5000:
             break
 
-        time.sleep(0.2)  # Rate limiting
+        time.sleep(0.3)  # Rate limiting
 
     logger.info(f"Fetched {len(all_markets)} active markets from Gamma API")
     return all_markets
+
+
+def test_connectivity() -> dict:
+    """Test connectivity to all Polymarket API endpoints. Returns diagnostic info."""
+    results = {}
+    session = _create_session()
+
+    # Test Gamma API
+    try:
+        resp = session.get(f"{config.GAMMA_API_URL}/markets",
+                          params={"limit": "1"}, timeout=15)
+        results["gamma_api"] = {
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "content_type": resp.headers.get("content-type", ""),
+            "server": resp.headers.get("server", ""),
+            "body_preview": resp.text[:200] if resp.text else "",
+        }
+    except requests.RequestException as e:
+        results["gamma_api"] = {"status": 0, "ok": False, "error": str(e)}
+
+    # Test CLOB API
+    try:
+        resp = session.get(f"{config.CLOB_API_URL}/", timeout=15)
+        results["clob_api"] = {
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "content_type": resp.headers.get("content-type", ""),
+            "server": resp.headers.get("server", ""),
+            "body_preview": resp.text[:200] if resp.text else "",
+        }
+    except requests.RequestException as e:
+        results["clob_api"] = {"status": 0, "ok": False, "error": str(e)}
+
+    # Test CLOB server time (lightweight endpoint)
+    try:
+        resp = session.get(f"{config.CLOB_API_URL}/time", timeout=15)
+        results["clob_time"] = {
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "body": resp.text[:100] if resp.text else "",
+        }
+    except requests.RequestException as e:
+        results["clob_time"] = {"status": 0, "ok": False, "error": str(e)}
+
+    # General internet check
+    try:
+        resp = session.get("https://httpbin.org/ip", timeout=10)
+        results["internet"] = {
+            "ok": True,
+            "your_ip": resp.json().get("origin", "unknown") if resp.ok else "unknown",
+        }
+    except requests.RequestException:
+        results["internet"] = {"ok": False, "your_ip": "unreachable"}
+
+    return results
 
 
 def parse_market(raw: dict) -> Optional[MarketInfo]:
