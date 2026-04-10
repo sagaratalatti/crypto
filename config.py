@@ -57,3 +57,17 @@ ORDER_CHECK_INTERVAL = int(os.getenv("ORDER_CHECK_INTERVAL", "60"))  # 1 min
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# ─── BTC-Only Mode ──────────────────────────────────────────────────────────
+# When True, only scan and trade Bitcoin price markets
+BTC_ONLY_MODE = os.getenv("BTC_ONLY_MODE", "true").lower() == "true"
+
+# Keywords used to identify BTC markets in Polymarket questions
+BTC_KEYWORDS = ["bitcoin", "btc", "bitcoin price", "₿"]
+
+# BTC price ladder: expected active price targets (USD)
+# The bot detects these dynamically, but this seeds the search
+BTC_PRICE_TARGETS = [
+    50000, 55000, 60000, 65000, 70000, 75000, 80000, 85000,
+    90000, 95000, 100000, 110000, 120000, 150000, 200000,
+]

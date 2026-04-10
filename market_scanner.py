@@ -77,6 +77,9 @@ class MarketInfo:
     days_to_resolution: float = -1.0  # -1 = unknown
     theta_regime: str = "unknown"
     theta_size_multiplier: float = 1.0
+    # BTC-specific fields
+    btc_price_target: float = 0.0  # Extracted price target (e.g., 80000)
+    btc_direction: str = ""        # "above" or "below" or "hit" or ""
 
 
 def fetch_active_markets(limit: int = 100) -> list[dict]:
@@ -259,6 +262,102 @@ def enrich_with_orderbook(market: MarketInfo, clob_client) -> MarketInfo:
     return market
 
 
+import re
+
+# ─── BTC Market Detection ────────────────────────────────────────────────────
+
+def is_btc_market(market: MarketInfo) -> bool:
+    """Check if a market is about Bitcoin price."""
+    q = market.question.lower()
+    slug = market.slug.lower() if market.slug else ""
+    tags_lower = [t.lower() for t in market.tags]
+
+    # Check question text
+    for kw in config.BTC_KEYWORDS:
+        if kw in q:
+            return True
+
+    # Check slug
+    if "bitcoin" in slug or "btc" in slug:
+        return True
+
+    # Check tags
+    if any("bitcoin" in t or "btc" in t for t in tags_lower):
+        return True
+
+    return False
+
+
+def extract_btc_price_target(market: MarketInfo) -> tuple[float, str]:
+    """
+    Extract the BTC price target and direction from a market question.
+
+    Examples:
+    - "Will Bitcoin hit $80,000?" -> (80000, "hit")
+    - "Bitcoin above $75k by April?" -> (75000, "above")
+    - "What price will Bitcoin hit in April?" -> (0, "range") (multi-outcome)
+    """
+    q = market.question
+
+    # Match patterns like $80,000 or $80000 or 80,000 or 80k or 80K
+    patterns = [
+        r'\$?([\d,]+)[kK]',           # 80k, $80K
+        r'\$\s*([\d,]+(?:\.\d+)?)',    # $80,000 or $80000
+        r'([\d,]{4,})',                # 80000 or 80,000 (4+ digits)
+    ]
+
+    price = 0.0
+    for pattern in patterns:
+        matches = re.findall(pattern, q)
+        for match in matches:
+            try:
+                val = float(match.replace(",", ""))
+                # If it looks like "80k" format, multiply by 1000
+                if val < 1000 and "k" in q.lower():
+                    val *= 1000
+                # Reasonable BTC price range
+                if 10000 <= val <= 500000:
+                    price = val
+                    break
+            except ValueError:
+                continue
+        if price > 0:
+            break
+
+    # Detect direction
+    q_lower = q.lower()
+    direction = ""
+    if "above" in q_lower or "over" in q_lower or "exceed" in q_lower:
+        direction = "above"
+    elif "below" in q_lower or "under" in q_lower:
+        direction = "below"
+    elif "hit" in q_lower or "reach" in q_lower:
+        direction = "hit"
+    elif "price" in q_lower and "what" in q_lower:
+        direction = "range"
+    elif price > 0:
+        direction = "hit"  # Default for price-target markets
+
+    return price, direction
+
+
+def enrich_btc_fields(markets: list[MarketInfo]) -> list[MarketInfo]:
+    """Enrich BTC markets with price target and direction data."""
+    for m in markets:
+        if is_btc_market(m):
+            target, direction = extract_btc_price_target(m)
+            m.btc_price_target = target
+            m.btc_direction = direction
+    return markets
+
+
+def filter_btc_markets(markets: list[MarketInfo]) -> list[MarketInfo]:
+    """Filter to only Bitcoin price markets."""
+    btc = [m for m in markets if is_btc_market(m)]
+    logger.info(f"Found {len(btc)} Bitcoin markets out of {len(markets)} total")
+    return btc
+
+
 def filter_markets(markets: list[MarketInfo]) -> list[MarketInfo]:
     """Filter markets by trading criteria defined in config."""
     filtered = []
@@ -323,6 +422,11 @@ def scan_markets(clob_client=None) -> list[MarketInfo]:
 
     # Filter by trading criteria
     tradeable = filter_markets(parsed)
+
+    # BTC-only mode: filter to Bitcoin markets only
+    if config.BTC_ONLY_MODE:
+        tradeable = filter_btc_markets(tradeable)
+        tradeable = enrich_btc_fields(tradeable)
 
     # Sort by volume (most liquid first)
     tradeable.sort(key=lambda m: m.volume_24h, reverse=True)

@@ -28,6 +28,8 @@ class Signal(Enum):
     VALUE_BET = "value_bet"
     MEAN_REVERSION = "mean_reversion"
     MOMENTUM = "momentum"
+    BTC_LADDER = "btc_ladder"        # Cross-price-target arbitrage
+    BTC_SENTIMENT = "btc_sentiment"  # Volume/momentum specific to BTC
 
 
 class Side(Enum):
@@ -313,20 +315,269 @@ def analyze_momentum(market: MarketInfo) -> list[TradeOpportunity]:
     return opportunities
 
 
+def analyze_btc_ladder(markets: list[MarketInfo]) -> list[TradeOpportunity]:
+    """
+    BTC Price Ladder Strategy.
+
+    Exploits logical constraints between BTC price target markets:
+    - "BTC > $80k" should ALWAYS be priced >= "BTC > $90k"
+    - If $80k is at 54% and $90k is at 35%, the gap (19%) represents
+      the implied probability of BTC landing between $80k-$90k
+    - When this gap is too narrow or too wide vs historical norms, trade it
+
+    Also detects:
+    - Overpriced long shots (e.g., "BTC > $150k" at 5% when $100k is at 15%)
+    - Underpriced near-certainties (e.g., "BTC > $60k" at 92% when price is $75k)
+    """
+    opportunities = []
+
+    # Build the price ladder: sort BTC markets by their price target
+    ladder = []
+    for m in markets:
+        if m.btc_price_target > 0 and m.btc_direction in ("hit", "above", ""):
+            yes_price = m.outcome_prices[0] if m.outcome_prices else 0
+            if yes_price > 0 and m.clob_token_ids:
+                ladder.append({
+                    "market": m,
+                    "target": m.btc_price_target,
+                    "yes_price": yes_price,
+                    "no_price": m.outcome_prices[1] if len(m.outcome_prices) > 1 else 1 - yes_price,
+                })
+
+    ladder.sort(key=lambda x: x["target"])
+
+    if len(ladder) < 2:
+        return opportunities
+
+    # 1. Monotonicity check: lower targets should have higher YES prices
+    for i in range(len(ladder) - 1):
+        lower = ladder[i]
+        higher = ladder[i + 1]
+
+        # If "BTC > $80k" (lower target) is priced LESS than "BTC > $90k" (higher target)
+        # that's a logical violation - arbitrage opportunity
+        if lower["yes_price"] < higher["yes_price"]:
+            edge = (higher["yes_price"] - lower["yes_price"]) / 2
+            if edge >= 0.02:
+                # Buy YES on the lower target (should be higher priced)
+                m = lower["market"]
+                opp = TradeOpportunity(
+                    market=m,
+                    signal=Signal.BTC_LADDER,
+                    side=Side.BUY_YES,
+                    token_id=m.clob_token_ids[0],
+                    entry_price=lower["yes_price"],
+                    estimated_true_prob=lower["yes_price"] + edge,
+                    edge=min(edge, 0.08),
+                    confidence=0.85,  # High confidence - this is a logical mispricing
+                    reason=f"Ladder violation: ${lower['target']:,.0f}@{lower['yes_price']:.3f} < ${higher['target']:,.0f}@{higher['yes_price']:.3f}"
+                )
+                opportunities.append(opp)
+
+    # 2. Gap analysis: find unusual gaps between adjacent targets
+    for i in range(len(ladder) - 1):
+        lower = ladder[i]
+        higher = ladder[i + 1]
+
+        gap = lower["yes_price"] - higher["yes_price"]
+        target_diff = higher["target"] - lower["target"]
+
+        if gap <= 0 or target_diff <= 0:
+            continue
+
+        # Normalized gap: probability drop per $1000 of target increase
+        gap_per_1k = gap / (target_diff / 1000)
+
+        # If gap is abnormally large, the higher target is underpriced
+        # (market is too pessimistic about BTC reaching the higher level)
+        if gap > 0.20 and gap_per_1k > 0.02:
+            m = higher["market"]
+            edge = min(gap * 0.15, 0.05)  # Conservative: expect 15% of gap to close
+            if edge >= config.MIN_EDGE:
+                opp = TradeOpportunity(
+                    market=m,
+                    signal=Signal.BTC_LADDER,
+                    side=Side.BUY_YES,
+                    token_id=m.clob_token_ids[0],
+                    entry_price=higher["yes_price"],
+                    estimated_true_prob=higher["yes_price"] + edge,
+                    edge=edge,
+                    confidence=0.55,
+                    reason=f"Wide gap: ${lower['target']:,.0f}({lower['yes_price']:.2f})->${higher['target']:,.0f}({higher['yes_price']:.2f}), gap={gap:.2f}"
+                )
+                opportunities.append(opp)
+
+        # If gap is abnormally small, the higher target is overpriced
+        # (market is too optimistic about BTC reaching much higher)
+        if gap < 0.05 and target_diff >= 10000:
+            m = higher["market"]
+            edge = min((0.10 - gap) * 0.3, 0.04)
+            if edge >= config.MIN_EDGE:
+                opp = TradeOpportunity(
+                    market=m,
+                    signal=Signal.BTC_LADDER,
+                    side=Side.BUY_NO,
+                    token_id=m.clob_token_ids[1],
+                    entry_price=higher["no_price"],
+                    estimated_true_prob=higher["no_price"] + edge,
+                    edge=edge,
+                    confidence=0.50,
+                    reason=f"Narrow gap: ${lower['target']:,.0f}({lower['yes_price']:.2f})->${higher['target']:,.0f}({higher['yes_price']:.2f}), gap={gap:.2f}"
+                )
+                opportunities.append(opp)
+
+    # 3. Near-certainty / long-shot detection
+    for rung in ladder:
+        m = rung["market"]
+        yes_p = rung["yes_price"]
+
+        # Long shots that are overpriced (e.g., BTC > $200k at 8%)
+        # The further out the target, the less likely. Check if it's priced too high
+        # relative to the nearest lower target
+        if yes_p > 0.03 and yes_p < 0.15:
+            # Find the nearest lower rung
+            lower_rungs = [r for r in ladder if r["target"] < rung["target"]]
+            if lower_rungs:
+                nearest = lower_rungs[-1]
+                expected_decay = (rung["target"] - nearest["target"]) / nearest["target"]
+                # If the target is 2x away but price hasn't decayed proportionally
+                if expected_decay > 0.3 and yes_p > nearest["yes_price"] * 0.5:
+                    edge = min(yes_p * 0.2, 0.04)
+                    if edge >= config.MIN_EDGE and m.clob_token_ids:
+                        opp = TradeOpportunity(
+                            market=m,
+                            signal=Signal.BTC_LADDER,
+                            side=Side.BUY_NO,
+                            token_id=m.clob_token_ids[1],
+                            entry_price=1 - yes_p,
+                            estimated_true_prob=(1 - yes_p) + edge,
+                            edge=edge,
+                            confidence=0.60,
+                            reason=f"Overpriced long shot: ${rung['target']:,.0f}@{yes_p:.3f}, nearest=${nearest['target']:,.0f}@{nearest['yes_price']:.3f}"
+                        )
+                        opportunities.append(opp)
+
+    return opportunities
+
+
+def analyze_btc_sentiment(market: MarketInfo) -> list[TradeOpportunity]:
+    """
+    BTC Sentiment Strategy.
+
+    Uses BTC-specific signals:
+    - Volume surge on a specific price target = informed money
+    - Price near 50/50 on a BTC target = maximum uncertainty = maximum edge potential
+    - High volume-to-liquidity ratio on BTC markets = strong conviction
+    """
+    opportunities = []
+
+    if not market.clob_token_ids or not market.btc_price_target:
+        return opportunities
+
+    yes_price = market.outcome_prices[0] if market.outcome_prices else 0
+    if not (0.10 <= yes_price <= 0.90):
+        return opportunities
+
+    # Volume surge: BTC markets with abnormally high volume
+    # have strong conviction signals
+    if market.volume_24h > 50000 and market.liquidity > 0:
+        vol_ratio = market.volume_24h / market.liquidity
+
+        if vol_ratio > 8.0:
+            # Extreme volume - strong directional bet
+            if yes_price > 0.50:
+                edge = min((vol_ratio - 8) * 0.003, 0.04)
+                if edge >= config.MIN_EDGE:
+                    opp = TradeOpportunity(
+                        market=market,
+                        signal=Signal.BTC_SENTIMENT,
+                        side=Side.BUY_YES,
+                        token_id=market.clob_token_ids[0],
+                        entry_price=market.best_ask if market.best_ask > 0 else yes_price,
+                        estimated_true_prob=min(yes_price + edge, 0.95),
+                        edge=edge,
+                        confidence=0.50,
+                        reason=f"BTC vol surge: ${market.btc_price_target:,.0f}, V/L={vol_ratio:.1f}x, YES@{yes_price:.3f}"
+                    )
+                    opportunities.append(opp)
+            elif yes_price < 0.50:
+                edge = min((vol_ratio - 8) * 0.003, 0.04)
+                if edge >= config.MIN_EDGE:
+                    opp = TradeOpportunity(
+                        market=market,
+                        signal=Signal.BTC_SENTIMENT,
+                        side=Side.BUY_NO,
+                        token_id=market.clob_token_ids[1],
+                        entry_price=1 - yes_price,
+                        estimated_true_prob=min((1 - yes_price) + edge, 0.95),
+                        edge=edge,
+                        confidence=0.50,
+                        reason=f"BTC vol surge: ${market.btc_price_target:,.0f}, V/L={vol_ratio:.1f}x, NO@{1-yes_price:.3f}"
+                    )
+                    opportunities.append(opp)
+
+    # Tight-range BTC targets (40-60%) have the most edge potential
+    # because small information changes move them significantly
+    if 0.40 <= yes_price <= 0.60 and market.best_bid > 0 and market.best_ask > 0:
+        book_mid = (market.best_bid + market.best_ask) / 2
+        book_vs_price = book_mid - yes_price
+
+        # If the order book midpoint disagrees with the displayed price
+        if abs(book_vs_price) > 0.03:
+            edge = min(abs(book_vs_price) * 0.6, 0.05)
+            if edge >= config.MIN_EDGE:
+                if book_vs_price > 0:
+                    opp = TradeOpportunity(
+                        market=market,
+                        signal=Signal.BTC_SENTIMENT,
+                        side=Side.BUY_YES,
+                        token_id=market.clob_token_ids[0],
+                        entry_price=yes_price,
+                        estimated_true_prob=book_mid,
+                        edge=edge,
+                        confidence=0.55,
+                        reason=f"BTC book signal: ${market.btc_price_target:,.0f}, book_mid={book_mid:.3f} vs price={yes_price:.3f}"
+                    )
+                    opportunities.append(opp)
+                else:
+                    opp = TradeOpportunity(
+                        market=market,
+                        signal=Signal.BTC_SENTIMENT,
+                        side=Side.BUY_NO,
+                        token_id=market.clob_token_ids[1],
+                        entry_price=1 - yes_price,
+                        estimated_true_prob=1 - book_mid,
+                        edge=edge,
+                        confidence=0.55,
+                        reason=f"BTC book signal: ${market.btc_price_target:,.0f}, book_mid={book_mid:.3f} vs price={yes_price:.3f}"
+                    )
+                    opportunities.append(opp)
+
+    return opportunities
+
+
 def generate_signals(markets: list[MarketInfo]) -> list[TradeOpportunity]:
     """Run all strategy analyzers across all markets and collect opportunities."""
     all_opportunities = []
+
+    # BTC ladder strategy runs across ALL markets (cross-market analysis)
+    if config.BTC_ONLY_MODE:
+        all_opportunities.extend(analyze_btc_ladder(markets))
 
     for market in markets:
         # Skip expired markets
         if market.theta_regime == "expired":
             continue
 
-        # Run each strategy
+        # Run general strategies
         all_opportunities.extend(analyze_spread_capture(market))
         all_opportunities.extend(analyze_value_bet(market))
         all_opportunities.extend(analyze_mean_reversion(market))
         all_opportunities.extend(analyze_momentum(market))
+
+        # Run BTC-specific strategies
+        if config.BTC_ONLY_MODE:
+            all_opportunities.extend(analyze_btc_sentiment(market))
 
     # Apply time-to-resolution adjustments
     for opp in all_opportunities:
